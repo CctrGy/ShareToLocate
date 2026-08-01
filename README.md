@@ -110,6 +110,16 @@ Before publishing, review [docs/PLAY_STORE_CHECKLIST.md](docs/PLAY_STORE_CHECKLI
 
 ShareToLocate was inspired by and is based on the original [ToLoShare](https://github.com/zoff99/ToLoShare) project by zoff99. The original project established the idea of sharing location through Tox; this repository provides a separate modern Android implementation with the changes listed above.
 
+## License
+
+Copyright (C) 2026 ShareToLocate contributors.
+
+ShareToLocate is free software licensed under the **GNU General Public License v3.0 only** (`GPL-3.0-only`). You may use, study, copy, modify, and redistribute it under the terms of that license. Distributed modified versions must remain under GPL-3.0-only and their corresponding source code must be made available.
+
+See [LICENSE](LICENSE) for the complete license text.
+
+ToLoShare and ToxAndroidRefImpl are also distributed under GPL-3.0-only. Their respective copyrights remain with their original authors and contributors.
+
 ## Disclaimer
 
 Location-sharing software handles sensitive personal data. Review the source, permissions, privacy policy, and release configuration before distributing or relying on the application.
