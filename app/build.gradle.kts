@@ -18,8 +18,8 @@ android {
         applicationId = "com.sharetolocate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.3.0"
+        versionCode = 13
+        versionName = "1.3.6"
     }
     buildFeatures { compose = true; buildConfig = true }
     signingConfigs {
@@ -61,7 +61,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.7")
     implementation("androidx.security:security-crypto:1.1.0")
     implementation("androidx.startup:startup-runtime:1.2.0")
-    implementation("com.github.zoff99:pkgs_ToxAndroidRefImpl:1.0.179")
+    implementation(files("libs/tox-android-refimpl-1.0.179.aar"))
     implementation("com.google.zxing:core:3.5.4")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     testImplementation("junit:junit:4.13.2")

@@ -2,7 +2,7 @@
 
 ShareToLocate is a private, peer-to-peer location-sharing application for Android. It allows trusted contacts to exchange their real-time location directly through the Tox network, without requiring a central location server or exposing a public IP address during contact pairing.
 
-The project is based on the concept and core workflow of [zoff99/ToLoShare](https://github.com/zoff99/ToLoShare). ShareToLocate is a modern, independent reimplementation written for current Android versions; it does not copy the original application's source code.
+The project is based on the concept and core workflow of zoff99's ToLoShare. ShareToLocate is a modern, independent reimplementation written for current Android versions; it does not copy the original application's source code.
 
 ## Features
 
@@ -108,7 +108,7 @@ Before publishing, review [docs/PLAY_STORE_CHECKLIST.md](docs/PLAY_STORE_CHECKLI
 
 ## Attribution
 
-ShareToLocate was inspired by and is based on the original [ToLoShare](https://github.com/zoff99/ToLoShare) project by zoff99. The original project established the idea of sharing location through Tox; this repository provides a separate modern Android implementation with the changes listed above.
+ShareToLocate was inspired by and is based on the original ToLoShare project by zoff99. The original project established the idea of sharing location through Tox; this repository provides a separate modern Android implementation with the changes listed above.
 
 ## Disclaimer
 

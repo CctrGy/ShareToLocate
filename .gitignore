@@ -11,3 +11,5 @@ captures/
 *.keystore
 release-keystore.properties
 artifacts/
+.tools/
+/*.apk

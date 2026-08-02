@@ -27,9 +27,13 @@ class LocationSharingService : Service() {
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
         startForeground(NOTIFICATION_ID, notification())
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5_000).setMinUpdateIntervalMillis(2_000).setMinUpdateDistanceMeters(3f).build()
+            fused.removeLocationUpdates(callback)
+            val interval = ShareRepository.get(this).state.value.settings.locationIntervalMinutes * 60_000L
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, interval).setMinUpdateIntervalMillis(interval / 2).setMinUpdateDistanceMeters(3f).build()
             fused.requestLocationUpdates(request, callback, mainLooper)
-            ShareRepository.get(this).setSharing(true)
+            val repository = ShareRepository.get(this)
+            if (intent?.action != ACTION_REFRESH_INTERVAL) repository.setSharing(true)
+            fused.lastLocation.addOnSuccessListener { location -> location?.let { repository.setOwnLocation(GeoPoint(it.latitude, it.longitude, it.accuracy, it.time)) } }
         }
         return START_STICKY
     }
@@ -42,5 +46,5 @@ class LocationSharingService : Service() {
         val stop = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("Compartiendo tu ubicación").setContentText("Cifrada y visible solo para tus contactos").setOngoing(true).setContentIntent(open).addAction(0, "Detener", stop).build()
     }
-    companion object { const val ACTION_STOP = "com.sharetolocate.STOP"; private const val CHANNEL = "location_sharing"; private const val NOTIFICATION_ID = 72 }
+    companion object { const val ACTION_STOP = "com.sharetolocate.STOP"; const val ACTION_REFRESH_INTERVAL = "com.sharetolocate.REFRESH_INTERVAL"; const val CHANNEL = "location_sharing"; private const val NOTIFICATION_ID = 72 }
 }

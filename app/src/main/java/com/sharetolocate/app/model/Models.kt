@@ -5,6 +5,7 @@ data class GeoPoint(val latitude: Double, val longitude: Double, val accuracy: F
 data class Peer(
     val id: String,
     val name: String,
+    val nickname: String? = null,
     val friendNumber: Long = -1,
     val online: Boolean = false,
     val sharing: Boolean = false,
@@ -19,7 +20,7 @@ data class Peer(
     val remoteNonce: String = "",
     val allowRing: Boolean = false,
     val remoteAllowsRing: Boolean = false
-)
+) { val displayName: String get() = nickname?.trim()?.takeIf { it.isNotEmpty() } ?: name }
 
 data class ContactRequest(val publicKey: String, val name: String, val nonce: String, val receivedAt: Long = System.currentTimeMillis())
 
@@ -39,7 +40,12 @@ data class AppSettings(
     val mapStyle: MapStyle = MapStyle.STREETS,
     val accentColor: AccentColor = AccentColor.MINT,
     val allowRing: Boolean = false,
-    val ringBehavior: RingBehavior = RingBehavior.NOTIFICATION_ONLY
+    val allowRingWithoutLocation: Boolean = false,
+    val ringBehavior: RingBehavior = RingBehavior.NOTIFICATION_ONLY,
+    val locationIntervalMinutes: Int = 15,
+    val startLocateOnBoot: Boolean = true,
+    val helpToEnabled: Boolean = false,
+    val helpToPeerId: String? = null
 )
 
 data class AppState(
@@ -48,6 +54,7 @@ data class AppState(
     val ownLocation: GeoPoint? = null,
     val peers: List<Peer> = emptyList(),
     val sharing: Boolean = false,
+    val sharingPausedUntil: Long? = null,
     val followTarget: FollowTarget = FollowTarget.NONE,
     val followedPeerId: String? = null,
     val settings: AppSettings = AppSettings(),
