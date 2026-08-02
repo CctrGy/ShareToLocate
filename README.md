@@ -70,6 +70,12 @@ See [docs/PRIVACY_POLICY.md](docs/PRIVACY_POLICY.md) for the current privacy pol
 - Android SDK 36
 - Android 8.0 (API level 26) or newer
 
+## Download
+
+Download the latest signed APK from [GitHub Releases](https://github.com/CctrGy/ShareToLocate/releases/latest/download/app.apk).
+
+Android may ask for permission to install applications from the browser or file manager used to open the APK.
+
 ## Build
 
 To build a debug APK on Windows:
