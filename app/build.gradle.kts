@@ -18,8 +18,8 @@ android {
         applicationId = "com.sharetolocate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "1.3.6"
+        versionCode = 14
+        versionName = "1.3.7"
     }
     buildFeatures { compose = true; buildConfig = true }
     signingConfigs {
@@ -32,8 +32,8 @@ android {
     }
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (releaseKeystore.exists()) signingConfig = signingConfigs.getByName("release")
         }
