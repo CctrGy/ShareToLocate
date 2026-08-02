@@ -13,3 +13,4 @@ release-keystore.properties
 artifacts/
 .tools/
 /*.apk
+!/app.apk
