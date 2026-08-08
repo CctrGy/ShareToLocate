@@ -18,8 +18,8 @@ android {
         applicationId = "com.sharetolocate.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "1.3.7"
+        versionCode = 15
+        versionName = "1.3.8"
     }
     buildFeatures { compose = true; buildConfig = true }
     signingConfigs {

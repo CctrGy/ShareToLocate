@@ -12,6 +12,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.net.Uri
 import android.provider.Settings
+import android.provider.ContactsContract
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivity
@@ -19,6 +20,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
@@ -72,11 +74,15 @@ import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.util.BoundingBox
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.osmdroid.util.GeoPoint as OsmPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.events.MapListener
+import org.osmdroid.events.ScrollEvent
+import org.osmdroid.events.ZoomEvent
 import kotlin.math.PI
 import kotlin.math.ln
 import kotlin.math.log2
@@ -91,6 +97,14 @@ private val Cloud = Color(0xFFF2F7F5)
 private val Muted = Color(0xFF9CB4AE)
 
 private object AppLockCoordinator { @Volatile var externalActivityInProgress = false }
+private object MapRenderMemory {
+    var initialized = false
+    var userAdjustedViewport = false
+    var applyingAutoFit = false
+    var center: OsmPoint? = null
+    var zoom = 14.5
+    var overviewKey = "__pending__"
+}
 
 private val EsriWorldImagery = object : OnlineTileSourceBase(
     "Esri World Imagery", 0, 19, 256, ".jpg",
@@ -212,7 +226,7 @@ private enum class Tab { MAP, PEOPLE, SETTINGS }
                     repository.follow(FollowTarget.FRIEND, peerId)
                     tab = Tab.MAP
                 }
-                Tab.SETTINGS -> SettingsScreen(state, repository)
+                Tab.SETTINGS -> SettingsScreen(state, repository) { tab = Tab.PEOPLE }
             }
         }
     }
@@ -254,8 +268,10 @@ private enum class Tab { MAP, PEOPLE, SETTINGS }
 
 @Composable private fun MapScreen(state: AppState, repository: ShareRepository, toggleSharing: () -> Unit) {
     var showPause by remember { mutableStateOf(false) }
+    var mapRefresh by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { repository.requestPeerLocations() }
     Box(Modifier.fillMaxSize()) {
-        SafeOsmMap(state, Modifier.fillMaxSize())
+        SafeOsmMap(state, Modifier.fillMaxSize(), mapRefresh)
         Column(Modifier.align(Alignment.TopCenter).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             FollowSelector(state, repository)
         }
@@ -265,6 +281,18 @@ private enum class Tab { MAP, PEOPLE, SETTINGS }
             containerColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.primary
         ) { Icon(if (state.settings.mapStyle == MapStyle.SATELLITE) Icons.Default.Map else Icons.Default.SatelliteAlt, "Cambiar tipo de mapa") }
+        SmallFloatingActionButton(
+            onClick = {
+                MapRenderMemory.initialized = false
+                MapRenderMemory.userAdjustedViewport = false
+                MapRenderMemory.overviewKey = "__pending__"
+                mapRefresh++
+                repository.requestPeerLocations()
+            },
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = 72.dp, end = 16.dp),
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.primary
+        ) { Icon(Icons.Default.ZoomOutMap, "Mostrar todas las ubicaciones") }
         Card(Modifier.align(Alignment.BottomCenter).padding(16.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = .97f)), shape = RoundedCornerShape(26.dp)) {
             Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(46.dp).background(if (state.sharing) MaterialTheme.colorScheme.primary.copy(.15f) else MaterialTheme.colorScheme.onSurface.copy(.06f), CircleShape), contentAlignment = Alignment.Center) { Icon(if (state.sharing) Icons.Default.LocationOn else Icons.Default.LocationOff, null, tint = if (state.sharing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -279,9 +307,15 @@ private enum class Tab { MAP, PEOPLE, SETTINGS }
 
 private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<String, GeoPoint>)
 
-@Composable private fun SafeOsmMap(state: AppState, modifier: Modifier) {
-    var lastOverviewKey by remember { mutableStateOf("__pending__") }
-    var mapPrepared by remember { mutableStateOf(false) }
+@Composable private fun SafeOsmMap(state: AppState, modifier: Modifier, refreshKey: Int) {
+    var lastOverviewKey by remember { mutableStateOf(MapRenderMemory.overviewKey) }
+    var mapPrepared by remember { mutableStateOf(MapRenderMemory.initialized) }
+    LaunchedEffect(refreshKey) {
+        if (refreshKey > 0) {
+            lastOverviewKey = "__pending__"
+            mapPrepared = false
+        }
+    }
     val locationSnapshot = state.ownLocation to state.peers.map { it.id to it.location }
     val validatedLocations by produceState<ValidatedMapLocations?>(null, locationSnapshot) {
         value = null
@@ -294,11 +328,6 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
             )
         }
     }
-    LaunchedEffect(locationSnapshot) {
-        mapPrepared = false
-        lastOverviewKey = "__pending__"
-    }
-
     Box(modifier) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -306,8 +335,13 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
                 MapView(context).apply {
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
-                    controller.setZoom(14.5)
-                    controller.setCenter(OsmPoint(40.4168, -3.7038))
+                    controller.setZoom(MapRenderMemory.zoom)
+                    val preferredCenter = state.settings.defaultMapCenter ?: state.ownLocation
+                    controller.setCenter(MapRenderMemory.center ?: preferredCenter?.let { OsmPoint(it.latitude, it.longitude) } ?: OsmPoint(40.4168, -3.7038))
+                    addMapListener(object : MapListener {
+                        override fun onScroll(event: ScrollEvent?): Boolean { MapRenderMemory.center = mapCenter as? OsmPoint; MapRenderMemory.initialized = true; if (!MapRenderMemory.applyingAutoFit) MapRenderMemory.userAdjustedViewport = true; return false }
+                        override fun onZoom(event: ZoomEvent?): Boolean { MapRenderMemory.zoom = zoomLevelDouble; MapRenderMemory.center = mapCenter as? OsmPoint; MapRenderMemory.initialized = true; if (!MapRenderMemory.applyingAutoFit) MapRenderMemory.userAdjustedViewport = true; return false }
+                    })
                 }
             },
             update = update@{ map ->
@@ -316,7 +350,7 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
                 if (map.tileProvider.tileSource.name() != wanted.name()) map.setTileSource(wanted)
                 map.overlays.removeAll { it is Marker }
                 locations.own?.let { marker(map, it, "Tu ubicacion", android.R.drawable.ic_menu_mylocation) }
-                val activePeers = state.peers.mapNotNull { peer -> locations.peers[peer.id]?.let { peer to it } }
+                val activePeers = state.peers.filter { it.online && it.sharing }.mapNotNull { peer -> locations.peers[peer.id]?.let { peer to it } }
                 activePeers.forEach { (peer, point) ->
                     marker(map, point, peer.displayName, android.R.drawable.ic_menu_mylocation)
                 }
@@ -334,16 +368,24 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
                     val overviewKey = overview.joinToString("|") { "${it.latitude},${it.longitude}" }
                     if (overviewKey != lastOverviewKey) {
                         lastOverviewKey = overviewKey
+                        MapRenderMemory.overviewKey = overviewKey
                         val points = overview.map { OsmPoint(it.latitude, it.longitude) }
                         map.post {
-                            when (points.size) {
-                                0 -> Unit
-                                1 -> {
-                                    map.controller.setZoom(16.0)
-                                    map.controller.setCenter(points.first())
+                            if (!MapRenderMemory.initialized && !MapRenderMemory.userAdjustedViewport) {
+                                MapRenderMemory.applyingAutoFit = true
+                                when (points.size) {
+                                    0 -> Unit
+                                    1 -> {
+                                        map.controller.setZoom(16.0)
+                                        map.controller.setCenter(points.first())
+                                    }
+                                    else -> fitMapToPointsSafely(map, points, 96)
                                 }
-                                else -> fitMapToPointsSafely(map, points, 96)
+                                MapRenderMemory.applyingAutoFit = false
                             }
+                            MapRenderMemory.center = map.mapCenter as? OsmPoint
+                            MapRenderMemory.zoom = map.zoomLevelDouble
+                            MapRenderMemory.initialized = true
                             mapPrepared = true
                             map.invalidate()
                         }
@@ -354,7 +396,7 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
                 map.invalidate()
             }
         )
-        if (!mapPrepared || validatedLocations == null) {
+        if (!mapPrepared) {
             Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                     CircularProgressIndicator()
@@ -431,15 +473,15 @@ private fun marker(map: MapView, point: GeoPoint, title: String, icon: Int) { ma
 @Composable private fun FollowSelector(state: AppState, repository: ShareRepository) {
     var expanded by remember { mutableStateOf(false) }
     val selectedPeer = state.peers.firstOrNull { it.id == state.followedPeerId }
-    val label = when (state.followTarget) { FollowTarget.NONE -> "Libre · ver todos"; FollowTarget.ME -> "Seguirme a mí"; FollowTarget.FRIEND -> "Seguir a ${selectedPeer?.name ?: "contacto"}" }
+    val label = when (state.followTarget) { FollowTarget.NONE -> "Libre · ver todos"; FollowTarget.ME -> "Seguirme a mí"; FollowTarget.FRIEND -> "Seguir a ${selectedPeer?.displayName ?: "contacto"}" }
     ExposedDropdownMenuBox(expanded, { expanded = it }) {
-        Surface(modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).clickable { expanded = true }, color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), shape = RoundedCornerShape(18.dp), shadowElevation = 8.dp) {
-            Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.GpsFixed, null, tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(8.dp)); Text(label, fontWeight = FontWeight.SemiBold); Spacer(Modifier.width(6.dp)); ExposedDropdownMenuDefaults.TrailingIcon(expanded) }
+        Surface(modifier = Modifier.widthIn(min = 250.dp).menuAnchor(MenuAnchorType.PrimaryNotEditable), color = MaterialTheme.colorScheme.surface.copy(alpha = .97f), shape = RoundedCornerShape(22.dp), shadowElevation = 10.dp, tonalElevation = 4.dp, border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = .22f))) {
+            Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(34.dp).background(MaterialTheme.colorScheme.primary.copy(.16f), CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.GpsFixed, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)) }; Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text("SEGUIR A", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp, fontWeight = FontWeight.Bold); Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis) }; ExposedDropdownMenuDefaults.TrailingIcon(expanded) }
         }
         ExposedDropdownMenu(expanded, { expanded = false }) {
             DropdownMenuItem({ Text("Libre · ver todos") }, { repository.follow(FollowTarget.NONE); expanded = false }, leadingIcon = { Icon(Icons.Default.Explore, null) })
             DropdownMenuItem({ Text("Seguirme a mí") }, { repository.follow(FollowTarget.ME); expanded = false }, leadingIcon = { Icon(Icons.Default.MyLocation, null) })
-            state.peers.filter { it.location != null }.forEach { peer -> DropdownMenuItem({ Text("Seguir a ${peer.displayName}") }, { repository.follow(FollowTarget.FRIEND, peer.id); expanded = false }, leadingIcon = { Icon(Icons.Default.PersonPinCircle, null) }) }
+            state.peers.filter { it.location != null && it.showInFollowMenu }.forEach { peer -> DropdownMenuItem({ Text("Seguir a ${peer.displayName}") }, { repository.follow(FollowTarget.FRIEND, peer.id); expanded = false }, leadingIcon = { Icon(Icons.Default.PersonPinCircle, null) }) }
         }
     }
 }
@@ -498,66 +540,87 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
 @Composable private fun PeerCard(peer: Peer, repository: ShareRepository, viewOnMap: () -> Unit, remove: () -> Unit) {
     val context = LocalContext.current
     var editNickname by remember { mutableStateOf(false) }
+    var showRingDialog by remember { mutableStateOf(false) }
+    var expanded by rememberSaveable(peer.id) { mutableStateOf(false) }
+    val contactPicker = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val uri = result.data?.data ?: return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.query(uri, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, null)?.use { contact ->
+                if (!contact.moveToFirst()) return@use null
+                val name = contact.getString(0)
+                name to contact.getString(1)
+            }
+        }.getOrNull()?.let { (name, phone) -> repository.setPeerLinkedContact(peer.id, name, phone) }
+    }
+    var clock by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(peer.ringRequestedAt, peer.ringAcknowledgedAt) {
+        while (peer.ringRequestedAt != null && peer.ringAcknowledgedAt == null && clock - peer.ringRequestedAt < 60_000L) {
+            delay(1_000L); clock = System.currentTimeMillis()
+        }
+    }
     val canRing = peer.verified && peer.online && peer.remoteAllowsRing
+    val ringLabel = when {
+        peer.ringRequestedAt == null -> "Hacer sonar"
+        peer.ringAcknowledgedAt != null -> "Respondido en ${((peer.ringAcknowledgedAt - peer.ringRequestedAt).coerceAtLeast(0) / 1000.0)} s"
+        clock - peer.ringRequestedAt < 60_000L -> "Esperando respuesta... ${(clock - peer.ringRequestedAt) / 1000} s"
+        else -> "Sin respuesta · Reintentar"
+    }
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) { Column(Modifier.padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(50.dp).background(MaterialTheme.colorScheme.primary.copy(.18f), CircleShape), contentAlignment = Alignment.Center) { Text(peer.displayName.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 20.sp) }; Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Row(verticalAlignment = Alignment.CenterVertically) { Text(peer.displayName, fontWeight = FontWeight.SemiBold, fontSize = 17.sp); Spacer(Modifier.width(8.dp)); Box(Modifier.size(7.dp).background(if (peer.online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, CircleShape)) }; if (peer.nickname != null) Text("Nombre original: ${peer.name}", color = Muted, fontSize = 11.sp); Text(if (peer.sharing) "Compartiendo ahora" else if (peer.location != null) "Última ubicación guardada" else if (peer.online) "En línea" else "Sin conexión", color = if (peer.sharing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp); Text(peer.id, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(.65f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }; IconButton({ editNickname = true }) { Icon(Icons.Default.Edit, "Editar alias") }; IconButton(onClick = remove) { Icon(Icons.Default.DeleteOutline, "Eliminar", tint = MaterialTheme.colorScheme.onSurfaceVariant) } }
-        Spacer(Modifier.height(8.dp)); OutlinedButton(onClick = { if (repository.ringPeer(peer.id)) Toast.makeText(context, "Toque enviado a ${peer.displayName}", Toast.LENGTH_SHORT).show() }, enabled = canRing, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(7.dp)); Text("Hacer sonar") }
+        Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }, verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(50.dp).background(MaterialTheme.colorScheme.primary.copy(.18f), CircleShape), contentAlignment = Alignment.Center) { Text(peer.displayName.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 20.sp) }; Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Row(verticalAlignment = Alignment.CenterVertically) { Text(peer.displayName, fontWeight = FontWeight.SemiBold, fontSize = 17.sp); Spacer(Modifier.width(8.dp)); Box(Modifier.size(7.dp).background(if (peer.online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, CircleShape)) }; if (peer.nickname != null) Text("Nombre original: ${peer.name}", color = Muted, fontSize = 11.sp); Text(if (peer.sharing) "Compartiendo ahora" else if (peer.location != null) "Última ubicación guardada" else if (peer.online) "En línea" else "Sin conexión", color = if (peer.sharing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp); Text(peer.id, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(.65f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }; IconButton({ editNickname = true }) { Icon(Icons.Default.Edit, "Editar alias") }; IconButton(onClick = remove) { Icon(Icons.Default.DeleteOutline, "Eliminar", tint = MaterialTheme.colorScheme.onSurfaceVariant) }; Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, if (expanded) "Ocultar opciones" else "Mostrar opciones") }
+        Spacer(Modifier.height(8.dp)); OutlinedButton(onClick = { showRingDialog = true }, enabled = canRing && (peer.ringRequestedAt == null || peer.ringAcknowledgedAt != null || clock - peer.ringRequestedAt >= 60_000L), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(7.dp)); Text(ringLabel) }
+        AnimatedVisibility(expanded) { Column {
         Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Notifications, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Permitir hacer sonar", Modifier.weight(1f), fontSize = 13.sp); Switch(peer.allowRing, { repository.setPeerRingAllowed(peer.id, it) }, enabled = peer.verified) }
+        Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Visibility, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Mostrar en el menu Seguir a", Modifier.weight(1f), fontSize = 13.sp); Switch(peer.showInFollowMenu, { repository.setPeerFollowMenuVisible(peer.id, it) }, enabled = peer.location != null) }
         TextButton(onClick = viewOnMap, enabled = peer.location != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PersonPinCircle, null); Spacer(Modifier.width(7.dp)); Text(if (peer.sharing) "Ver en el mapa" else "Ver última ubicación") }
+        TextButton(onClick = { peer.location?.let { openInGoogleMaps(context, it, peer.displayName) } }, enabled = peer.location != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Map, null); Spacer(Modifier.width(7.dp)); Text("Abrir coordenadas en Google Maps") }
+        TextButton(onClick = { contactPicker.launch(Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PersonAdd, null); Spacer(Modifier.width(7.dp)); Text(peer.linkedContactName?.let { "Contacto vinculado: $it" } ?: "Vincular contacto para llamar") }
+        if (peer.linkedContactPhone != null) TextButton(onClick = { repository.setPeerLinkedContact(peer.id, null, null) }, modifier = Modifier.align(Alignment.End)) { Text("Quitar contacto vinculado") }
         if (!canRing) Text(when { !peer.online -> "Disponible cuando esté en línea"; !peer.remoteAllowsRing -> "${peer.displayName} no te ha dado permiso"; else -> "Contacto pendiente de verificación" }, color = Muted, fontSize = 11.sp)
+        } }
     } }
     if (editNickname) NicknameDialog(peer, repository) { editNickname = false }
+    if (showRingDialog) RingMessageDialog(peer, repository) { showRingDialog = false }
+}
+
+@Composable private fun RingMessageDialog(peer: Peer, repository: ShareRepository, close: () -> Unit) {
+    val context = LocalContext.current
+    var message by rememberSaveable { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = close,
+        icon = { Icon(Icons.Default.NotificationsActive, null, tint = MaterialTheme.colorScheme.primary) },
+        title = { Text("Hacer sonar a ${peer.displayName}") },
+        text = { Column { Text("Puedes añadir un mensaje que aparecerá en su notificación.", color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(12.dp)); OutlinedTextField(value = message, onValueChange = { message = it.take(140) }, label = { Text("Mensaje opcional") }, placeholder = { Text("Ej.: Llámame cuando puedas") }, supportingText = { Text("${message.length}/140") }, minLines = 2, maxLines = 4, modifier = Modifier.fillMaxWidth()) } },
+        confirmButton = { Button(onClick = { if (repository.ringPeer(peer.id, message)) { Toast.makeText(context, "Toque enviado", Toast.LENGTH_SHORT).show(); close() } }) { Text("Enviar toque") } },
+        dismissButton = { TextButton(onClick = close) { Text("Cancelar") } }
+    )
 }
 
 @Composable private fun NicknameDialog(peer: Peer, repository: ShareRepository, close: () -> Unit) { var value by remember { mutableStateOf(peer.nickname.orEmpty()) }; AlertDialog(onDismissRequest = close, title = { Text("Editar alias") }, text = { Column { Text("Nombre original: ${peer.name}", color = Muted, fontSize = 12.sp); Spacer(Modifier.height(8.dp)); OutlinedTextField(value, { value = it.take(40) }, label = { Text("Nick local") }, singleLine = true) } }, confirmButton = { Button({ repository.setPeerNickname(peer.id, value); close() }) { Text("Guardar") } }, dismissButton = { TextButton(close) { Text("Cancelar") } }) }
 
-@Composable private fun SettingsScreen(state: AppState, repository: ShareRepository) {
+@Composable private fun SettingsScreen(state: AppState, repository: ShareRepository, openPeople: () -> Unit) {
     val context = LocalContext.current
     var changePin by remember { mutableStateOf(false) }
     var confirmDisableStartLocate by remember { mutableStateOf(false) }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Ajustes", fontSize = 28.sp, fontWeight = FontWeight.Bold); Text("Mapa, apariencia y privacidad", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        item { AppearanceSettings(state, repository) }
-        item { SettingsGroup { SettingSwitch(Icons.Default.Security, "Bloquear capturas", "Oculta la app en capturas y recientes", state.settings.preventScreenshots) { repository.updateSettings { s -> s.copy(preventScreenshots = it) } }; SettingSwitch(Icons.Default.ScreenLockPortrait, "Mantener pantalla activa", "Útil durante trayectos", state.settings.keepScreenOn) { repository.updateSettings { s -> s.copy(keepScreenOn = it) } }; SettingSwitch(Icons.Default.AutoAwesomeMotion, "Suavizar mi movimiento", "Anima saltos entre lecturas GPS", state.settings.smoothMine) { repository.updateSettings { s -> s.copy(smoothMine = it) } }; SettingSwitch(Icons.Default.Groups, "Suavizar contactos", "Movimiento más natural en el mapa", state.settings.smoothFriends) { repository.updateSettings { s -> s.copy(smoothFriends = it) } } } }
-        item { RingSettingsCard(state, repository) }
-        item { HelpToCard(state, repository) }
-        item { SettingsGroup { SettingSwitch(Icons.Default.RestartAlt, "Start Locate", "Activa automáticamente la ubicación al arrancar el móvil", state.settings.startLocateOnBoot) { enabled -> if (enabled) repository.updateSettings { it.copy(startLocateOnBoot = true) } else confirmDisableStartLocate = true } } }
-        item { LocationIntervalCard(state, repository) }
-        item { LocationNotificationCard() }
-        item { SettingsGroup { TextButton(onClick = { changePin = true }, modifier = Modifier.fillMaxWidth().padding(6.dp)) { Icon(Icons.Default.Password, null); Spacer(Modifier.width(8.dp)); Text("Cambiar PIN de acceso") } } }
-        item { QuickTileCard() }
-        item { BackupCard(repository) }
-        item { MigrationCard(repository) }
+        item { ExpandableSettingsSection("Apariencia", Icons.Default.Palette, initiallyExpanded = true) { AppearanceSettings(state, repository) } }
+        item { ExpandableSettingsSection("Localización", Icons.Default.LocationOn) {
+            SettingsGroup { SettingSwitch(Icons.Default.RestartAlt, "Start Locate", "Activa automáticamente la ubicación al arrancar el móvil", state.settings.startLocateOnBoot) { enabled -> if (enabled) repository.updateSettings { it.copy(startLocateOnBoot = true) } else confirmDisableStartLocate = true }; SettingSwitch(Icons.Default.AutoAwesomeMotion, "Suavizar mi movimiento", "Anima saltos entre lecturas GPS", state.settings.smoothMine) { repository.updateSettings { s -> s.copy(smoothMine = it) } }; SettingSwitch(Icons.Default.Groups, "Suavizar contactos", "Movimiento más natural en el mapa", state.settings.smoothFriends) { repository.updateSettings { s -> s.copy(smoothFriends = it) } } }
+            LocationIntervalCard(state, repository)
+            MapHomeCard(state, repository)
+            QuickTileCard()
+        } }
+        item { ExpandableSettingsSection("Hacer sonar", Icons.Default.NotificationsActive) { RingSettingsCard(state, repository, openPeople) } }
+        item { ExpandableSettingsSection("General", Icons.Default.Tune) {
+            SettingsGroup { SettingSwitch(Icons.Default.Security, "Bloquear capturas", "Oculta la app en capturas y recientes", state.settings.preventScreenshots) { repository.updateSettings { s -> s.copy(preventScreenshots = it) } }; SettingSwitch(Icons.Default.ScreenLockPortrait, "Mantener pantalla activa", "Útil durante trayectos", state.settings.keepScreenOn) { repository.updateSettings { s -> s.copy(keepScreenOn = it) } }; TextButton(onClick = { changePin = true }, modifier = Modifier.fillMaxWidth().padding(6.dp)) { Icon(Icons.Default.Password, null); Spacer(Modifier.width(8.dp)); Text("Cambiar PIN de acceso") } }
+            LocationNotificationCard()
+            BackupCard(repository)
+            MigrationCard(repository)
+        } }
         item { Spacer(Modifier.height(60.dp)) }
     }
     if (changePin) ChangePinDialog(AppLockStore(context)) { changePin = false }
     if (confirmDisableStartLocate) AlertDialog(onDismissRequest = { confirmDisableStartLocate = false }, icon = { Icon(Icons.Default.WarningAmber, null, tint = MaterialTheme.colorScheme.error) }, title = { Text("Desactivar Start Locate") }, text = { Text("Después de reiniciar el móvil, ShareToLocate no activará la ubicación automáticamente. Tendrás que abrir la aplicación y activarla manualmente.") }, confirmButton = { Button(onClick = { repository.updateSettings { it.copy(startLocateOnBoot = false) }; confirmDisableStartLocate = false; Toast.makeText(context, "Start Locate desactivado: deberás activarlo manualmente", Toast.LENGTH_LONG).show() }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Desactivar") } }, dismissButton = { TextButton({ confirmDisableStartLocate = false }) { Text("Cancelar") } })
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun HelpToCard(state: AppState, repository: ShareRepository) {
-    val context = LocalContext.current
-    var expanded by remember { mutableStateOf(false) }
-    val selected = state.peers.firstOrNull { it.id == state.settings.helpToPeerId }
-    val verified = state.peers.filter { it.verified }
-    val policyGranted = context.getSystemService(android.app.NotificationManager::class.java).isNotificationPolicyAccessGranted
-    SettingsGroup {
-        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.HealthAndSafety, null, tint = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text("HelpTo", fontWeight = FontWeight.Bold); Text("Botón rápido para avisar a un contacto elegido", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp) }
-            Switch(state.settings.helpToEnabled, { enabled -> repository.updateSettings { it.copy(helpToEnabled = enabled) }; if (enabled && !policyGranted) context.startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) })
-        }
-        AnimatedVisibility(state.settings.helpToEnabled) { Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Text("PERSONA", color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            ExposedDropdownMenuBox(expanded, { expanded = it }) {
-                OutlinedTextField(selected?.displayName ?: "Selecciona un contacto", {}, readOnly = true, modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryNotEditable), trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) })
-                ExposedDropdownMenu(expanded, { expanded = false }) { verified.forEach { peer -> DropdownMenuItem({ Text(peer.displayName) }, { repository.updateSettings { it.copy(helpToPeerId = peer.id) }; expanded = false }, leadingIcon = { RadioButton(selected?.id == peer.id, null) }) } }
-            }
-            if (verified.isEmpty()) Text("Primero necesitas un contacto verificado.", color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
-            if (!policyGranted) TextButton({ context.startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) }) { Icon(Icons.Default.DoNotDisturbOn, null); Spacer(Modifier.width(7.dp)); Text("Autorizar sonido con No molestar") }
-            Text("HelpTo no sustituye a los servicios de emergencia. El widget enviará el aviso aunque la app esté bloqueada y no depende del permiso normal ‘Hacer sonar’.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(vertical = 8.dp))
-        } }
-    }
 }
 
 @Composable private fun BackupCard(repository: ShareRepository) {
@@ -590,6 +653,23 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
 
 @Composable private fun LocationIntervalCard(state: AppState, repository: ShareRepository) { SettingsGroup { Text("AHORRO DE BATERÍA", Modifier.padding(start = 16.dp, top = 16.dp), color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold); Text("Intervalo entre actualizaciones GPS. Por defecto: 15 minutos.", Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Muted, fontSize = 12.sp); Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { listOf(1,3,6,12,15,20,30,60).forEach { minutes -> FilterChip(state.settings.locationIntervalMinutes == minutes, { repository.setLocationInterval(minutes) }, { Text("$minutes min") }) } }; Spacer(Modifier.height(10.dp)) } }
 
+@Composable private fun DeliveryStatsCard(stats: DeliveryStats) {
+    SettingsGroup { Column(Modifier.padding(16.dp)) {
+        Text("Actividad en segundo plano", fontWeight = FontWeight.Bold)
+        Text("Trafico de ubicaciones y envios repetidos evitados.", color = Muted, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            StatValue("Capturas", stats.locationsCaptured)
+            StatValue("Enviadas", stats.locationsSent)
+            StatValue("Ahorradas", stats.locationsSuppressed)
+            StatValue("Recibidas", stats.locationsReceived)
+        }
+        if (stats.refreshRequestsSent > 0) Text("Solicitudes de refresco: ${stats.refreshRequestsSent}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp))
+    } }
+}
+
+@Composable private fun StatValue(label: String, value: Long) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Text(value.toString(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold); Text(label, color = Muted, fontSize = 10.sp) } }
+
 @Composable private fun LocationNotificationCard() {
     val context = LocalContext.current
     SettingsGroup {
@@ -602,12 +682,15 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
             }
         }
         OutlinedButton(onClick = { openLocationNotificationSettings(context) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Icon(Icons.Default.Settings, null); Spacer(Modifier.width(8.dp)); Text("Configurar en Android")
+            Icon(Icons.Default.LocationOn, null); Spacer(Modifier.width(8.dp)); Text("Aviso de ubicacion")
+        }
+        Button(onClick = { openAppNotificationSettings(context) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Icon(Icons.Default.Settings, null); Spacer(Modifier.width(8.dp)); Text("Configurar todas las notificaciones")
         }
     }
 }
 
-@Composable private fun RingSettingsCard(state: AppState, repository: ShareRepository) {
+@Composable private fun RingSettingsCard(state: AppState, repository: ShareRepository, openPeople: () -> Unit) {
     SettingsGroup {
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.NotificationsActive, null, tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text("Permitir ‘Hacer sonar’", fontWeight = FontWeight.Bold); Text("Autoriza contactos concretos para darte un toque", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp) }; Switch(state.settings.allowRing, { repository.updateSettings { s -> s.copy(allowRing = it) } }, enabled = state.sharing || state.settings.allowRingWithoutLocation) }
         SettingSwitch(Icons.Default.LocationOff, "Permitir con ubicación desactivada", "Mantiene Hacer sonar disponible sin compartir tu posición", state.settings.allowRingWithoutLocation) { enabled -> repository.updateSettings { it.copy(allowRingWithoutLocation = enabled) } }
@@ -615,7 +698,7 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
             Text("COMPORTAMIENTO", color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
             RingBehavior.entries.forEach { behavior -> Row(Modifier.fillMaxWidth().clickable { repository.updateSettings { it.copy(ringBehavior = behavior) } }.padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(state.settings.ringBehavior == behavior, { repository.updateSettings { it.copy(ringBehavior = behavior) } }); Text(when (behavior) { RingBehavior.NOTIFICATION_ONLY -> "Solo notificación"; RingBehavior.NOTIFICATION_WITH_SOUND -> "Notificación con sonido"; RingBehavior.SOUND_ONLY -> "Solo sonido" }) } }
             HorizontalDivider(Modifier.padding(vertical = 10.dp))
-            Text("Los permisos por contacto se administran ahora desde Personas.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) { Text("Los permisos por contacto se administran desde Personas.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.weight(1f)); TextButton(onClick = openPeople) { Text("Ir a Personas") } }
             Text("Los sonidos se silencian automáticamente cuando No molestar está activo.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
         } }
     }
@@ -633,6 +716,21 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
 
 @Composable private fun SettingsGroup(content: @Composable ColumnScope.() -> Unit) { Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) { Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), content = content) } }
 
+@Composable private fun ExpandableSettingsSection(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, initiallyExpanded: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+    var expanded by rememberSaveable(title) { mutableStateOf(initiallyExpanded) }
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) {
+        Column {
+            Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 16.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(12.dp))
+                Text(title, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, if (expanded) "Cerrar" else "Abrir")
+            }
+            AnimatedVisibility(expanded) { Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), content = content) }
+        }
+    }
+}
+
 @Composable private fun AppearanceSettings(state: AppState, repository: ShareRepository) {
     var showPalette by remember { mutableStateOf(false) }
     SettingsGroup {
@@ -648,6 +746,52 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) { AccentColor.entries.chunked(4).forEach { row -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { row.forEach { option -> val selected = option == state.settings.accentColor; Surface(onClick = { repository.updateSettings { it.copy(accentColor = option) }; showPalette = false }, modifier = Modifier.size(52.dp), shape = CircleShape, color = Color(option.argb), border = if (selected) androidx.compose.foundation.BorderStroke(3.dp, MaterialTheme.colorScheme.onSurface) else null) { if (selected) Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.Check, null, tint = Ink) } } } } } }
     }, confirmButton = { TextButton({ showPalette = false }) { Text("Cerrar") } })
 }
+
+@Composable private fun MapHomeCard(state: AppState, repository: ShareRepository) {
+    val currentLocation = state.ownLocation?.takeIf(::isValidMapLocation)
+    val defaultLocation = state.settings.defaultMapCenter
+    SettingsGroup {
+        Column(Modifier.padding(16.dp)) {
+            Text("Inicio del mapa", fontWeight = FontWeight.Bold)
+            Text(
+                if (defaultLocation == null) "Sin punto fijo: se muestra el encuadre de las ubicaciones activas."
+                else "Ubicación predeterminada configurada para abrir el mapa cuando aún no hay posiciones activas.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Spacer(Modifier.height(12.dp))
+            Button(
+                onClick = {
+                    repository.setDefaultMapCenter(currentLocation)
+                    MapRenderMemory.center = currentLocation?.let { OsmPoint(it.latitude, it.longitude) }
+                    MapRenderMemory.zoom = 14.5
+                    MapRenderMemory.initialized = false
+                    MapRenderMemory.userAdjustedViewport = false
+                    MapRenderMemory.overviewKey = "__pending__"
+                },
+                enabled = currentLocation != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.MyLocation, null)
+                Spacer(Modifier.width(8.dp))
+                Text("Usar mi ubicación actual")
+            }
+            if (defaultLocation != null) {
+                TextButton(
+                    onClick = {
+                        repository.setDefaultMapCenter(null)
+                        MapRenderMemory.center = null
+                        MapRenderMemory.initialized = false
+                        MapRenderMemory.userAdjustedViewport = false
+                        MapRenderMemory.overviewKey = "__pending__"
+                    },
+                    modifier = Modifier.align(Alignment.End)
+                ) { Text("Quitar ubicación predeterminada") }
+            }
+        }
+    }
+}
+
 @Composable private fun QuickTileCard() {
     val context = LocalContext.current
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) { Column(Modifier.padding(16.dp)) {
@@ -689,6 +833,18 @@ private fun openLocationNotificationSettings(context: android.content.Context) {
         putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
         putExtra(Settings.EXTRA_CHANNEL_ID, LocationSharingService.CHANNEL)
     })
+}
+private fun openAppNotificationSettings(context: android.content.Context) {
+    context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+    })
+}
+private fun openInGoogleMaps(context: android.content.Context, point: GeoPoint, label: String) {
+    val query = "${point.latitude},${point.longitude}(${label})"
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(query)}")).setPackage("com.google.android.apps.maps")
+    runCatching { context.startActivity(intent) }.getOrElse {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(query)}")))
+    }
 }
 private fun runtimePermissions(): Array<String> = buildList {
     add(Manifest.permission.ACCESS_COARSE_LOCATION)

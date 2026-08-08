@@ -39,9 +39,8 @@ class SharingWidgetProvider : AppWidgetProvider() {
                 scheduleResume(context, System.currentTimeMillis() + minutes * 60_000L)
             }
             ACTION_RESUME -> { ShareRepository.get(context).resumeSharing(); ensureService(context) }
-            ACTION_HELP -> ShareRepository.get(context).sendConfiguredHelp()
         }
-        if (intent.action in setOf(ACTION_CYCLE, ACTION_PAUSE, ACTION_RESUME, ACTION_HELP)) updateAll(context)
+        if (intent.action in setOf(ACTION_CYCLE, ACTION_PAUSE, ACTION_RESUME)) updateAll(context)
     }
 
     private fun update(context: Context, manager: AppWidgetManager, id: Int) {
@@ -58,9 +57,6 @@ class SharingWidgetProvider : AppWidgetProvider() {
         views.setTextViewText(R.id.widget_action, if (paused) "Reanudar" else "Pausar")
         views.setOnClickPendingIntent(R.id.widget_duration, action(context, ACTION_CYCLE, id))
         views.setOnClickPendingIntent(R.id.widget_action, action(context, if (paused) ACTION_RESUME else ACTION_PAUSE, id))
-        val helpEnabled = appPrefs.getBoolean("help_to_enabled", false) && !appPrefs.getString("help_to_peer", null).isNullOrBlank()
-        views.setViewVisibility(R.id.widget_help, if (helpEnabled) View.VISIBLE else View.GONE)
-        views.setOnClickPendingIntent(R.id.widget_help, action(context, ACTION_HELP, id))
         manager.updateAppWidget(id, views)
     }
 
@@ -84,7 +80,6 @@ class SharingWidgetProvider : AppWidgetProvider() {
         private const val ACTION_CYCLE = "com.sharetolocate.widget.CYCLE"
         private const val ACTION_PAUSE = "com.sharetolocate.widget.PAUSE"
         private const val ACTION_RESUME = "com.sharetolocate.widget.RESUME"
-        private const val ACTION_HELP = "com.sharetolocate.widget.HELP"
         private val DURATIONS = listOf(15, 60, 180, 360, 720, 1440)
         private fun durationLabel(minutes: Int) = when (minutes) { 15 -> "15 minutos"; 60 -> "1 hora"; else -> "${minutes / 60} horas" }
         fun updateAll(context: Context) {

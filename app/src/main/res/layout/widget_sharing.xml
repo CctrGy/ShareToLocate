@@ -7,5 +7,4 @@
         <Button android:id="@+id/widget_duration" android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1" android:text="1 hora" android:textSize="12sp" />
         <Button android:id="@+id/widget_action" android:layout_width="0dp" android:layout_height="44dp" android:layout_marginStart="8dp" android:layout_weight="1" android:text="Pausar" android:textSize="12sp" />
     </LinearLayout>
-    <Button android:id="@+id/widget_help" android:layout_width="match_parent" android:layout_height="44dp" android:layout_marginTop="6dp" android:text="Enviar HelpTo" android:textStyle="bold" android:visibility="gone" />
 </LinearLayout>

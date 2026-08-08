@@ -30,6 +30,7 @@ import com.sharetolocate.app.MainActivity
 import com.sharetolocate.app.quick.LocationQuickTileService
 import android.service.quicksettings.TileService
 import android.os.SystemClock
+import android.location.Location
 import com.sharetolocate.app.location.LocationSharingService
 import kotlinx.coroutines.*
 import com.sharetolocate.app.widget.SharingWidgetProvider
@@ -42,12 +43,16 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
         displayName = prefs.getString("display_name", "Mi ubicación") ?: "Mi ubicación",
         onboardingComplete = prefs.getBoolean("onboarding", false),
         sharingPausedUntil = prefs.getLong("sharing_paused_until", 0L).takeIf { it > System.currentTimeMillis() },
-        settings = loadSettings()
+        settings = loadSettings(),
+        ownLocation = loadOwnLocation(),
+        deliveryStats = loadDeliveryStats()
     ))
     val state: StateFlow<AppState> = _state.asStateFlow()
     private val engine = ToxEngine(context, this)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lastRingAt = mutableMapOf<String, Long>()
+    private val lastSentLocations = mutableMapOf<String, GeoPoint>()
+    private var lastRefreshRequestAt = 0L
 
     init {
         engine.start(_state.value.displayName)
@@ -60,8 +65,13 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
         _state.value = _state.value.copy(onboardingComplete = true, displayName = clean)
     }
     fun setOwnLocation(point: GeoPoint) {
+        if (!isValidLocation(point)) return
+        prefs.edit().putString("own_location", point.toJson().toString()).apply()
         _state.value = _state.value.copy(ownLocation = point)
-        if (isActivelySharing()) _state.value.peers.filter { it.verified && it.online }.forEach { engine.send(it.friendNumber, "STL1|LOC|${point.latitude}|${point.longitude}|${point.accuracy}|${point.timestamp}") }
+        updateStats { it.copy(locationsCaptured = it.locationsCaptured + 1) }
+        if (isActivelySharing()) _state.value.peers.filter { it.verified && it.online }.forEach { peer ->
+            if (shouldSendLocation(peer.id, point)) sendLocation(peer, point) else updateStats { it.copy(locationsSuppressed = it.locationsSuppressed + 1) }
+        }
     }
     fun setSharing(enabled: Boolean) {
         prefs.edit().putBoolean("sharing", enabled).also { if (!enabled) it.remove("sharing_paused_until") }.apply()
@@ -96,7 +106,6 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
         val previous = _state.value.settings
         _state.value = _state.value.copy(settings = transform(previous)); saveSettings()
         if (previous.allowRing != _state.value.settings.allowRing || previous.allowRingWithoutLocation != _state.value.settings.allowRingWithoutLocation) broadcastRingPermissions()
-        if (previous.helpToEnabled != _state.value.settings.helpToEnabled || previous.helpToPeerId != _state.value.settings.helpToPeerId) SharingWidgetProvider.updateAll(context)
     }
     fun setPeerRingAllowed(id: String, allowed: Boolean) {
         val peer = _state.value.peers.firstOrNull { it.id == id } ?: return
@@ -107,24 +116,41 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
     fun setPeerNickname(id: String, nickname: String) {
         _state.value.peers.firstOrNull { it.id == id }?.let { updatePeer(it.copy(nickname = nickname.trim().ifBlank { null })) }
     }
+    fun setPeerFollowMenuVisible(id: String, visible: Boolean) {
+        _state.value.peers.firstOrNull { it.id == id }?.let { updatePeer(it.copy(showInFollowMenu = visible)) }
+        if (!visible && _state.value.followedPeerId == id) follow(FollowTarget.NONE)
+    }
+    fun setPeerLinkedContact(id: String, name: String?, phone: String?) {
+        _state.value.peers.firstOrNull { it.id == id }?.let {
+            updatePeer(it.copy(linkedContactName = name?.trim()?.ifBlank { null }, linkedContactPhone = phone?.trim()?.ifBlank { null }))
+        }
+    }
     fun setLocationInterval(minutes: Int) {
-        val value = minutes.takeIf { it in listOf(1,3,6,12,15,20,30,60) } ?: 15
+        val value = minutes.takeIf { it in listOf(3,6,12,15,20,30,60) } ?: 15
         updateSettings { it.copy(locationIntervalMinutes = value) }
         if (_state.value.sharing) context.startService(Intent(context, LocationSharingService::class.java).setAction(LocationSharingService.ACTION_REFRESH_INTERVAL))
     }
-    fun ringPeer(id: String): Boolean {
+    fun setDefaultMapCenter(point: GeoPoint?) {
+        updateSettings { it.copy(defaultMapCenter = point?.takeIf(::isValidLocation)) }
+    }
+    fun ringPeer(id: String, message: String = ""): Boolean {
         val peer = _state.value.peers.firstOrNull { it.id == id } ?: return false
         if (!peer.verified || !peer.online || !peer.remoteAllowsRing) return false
-        return engine.send(peer.friendNumber, "STL1|RING|${System.currentTimeMillis()}")
+        val requestAt = System.currentTimeMillis()
+        val safeMessage = message.trim().take(140)
+        val sent = engine.send(peer.friendNumber, "STL1|RING|$requestAt|${ToxEngine.encode(safeMessage)}")
+        if (sent) updatePeer(peer.copy(ringRequestedAt = requestAt, ringAcknowledgedAt = null))
+        return sent
     }
 
-    fun sendConfiguredHelp(): Boolean {
-        val settings = _state.value.settings
-        if (!settings.helpToEnabled) return false
-        val peer = _state.value.peers.firstOrNull { it.id == settings.helpToPeerId && it.verified } ?: return false
-        if (peer.online && engine.send(peer.friendNumber, "STL1|HELP|${System.currentTimeMillis()}")) return true
-        prefs.edit().putString("pending_help_peer", peer.id).apply()
-        return true
+    fun requestPeerLocations() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRefreshRequestAt < 10_000L) return
+        lastRefreshRequestAt = now
+        val requestId = System.currentTimeMillis().toString()
+        var sent = 0L
+        _state.value.peers.filter { it.verified && it.online }.forEach { if (engine.send(it.friendNumber, "STL1|LOCREQ|$requestId")) sent++ }
+        if (sent > 0) updateStats { it.copy(refreshRequestsSent = it.refreshRequestsSent + sent) }
     }
 
     fun createMigrationOffer(): MigrationManager.Offer {
@@ -214,7 +240,6 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
             sendHello(updated)
             sendRingPermission(updated)
             if (updated.verified) { sendSharingState(updated); sendCurrentLocation(updated) }
-            if (updated.verified && prefs.getString("pending_help_peer", null) == updated.id && engine.send(updated.friendNumber, "STL1|HELP|${System.currentTimeMillis()}")) prefs.edit().remove("pending_help_peer").apply()
         }
     }
     override fun onMessage(friendNumber: Long, publicKey: String, message: String) {
@@ -232,25 +257,29 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
                 if (updated.verified && updated.online) { sendRingPermission(updated); sendSharingState(updated); sendCurrentLocation(updated) }
             }
             "SHARE" -> if (p.size >= 3) updatePeer(peer.copy(sharing = p[2] == "1"))
-            "LOC" -> if (p.size >= 6 && peer.verified) runCatching { GeoPoint(p[2].toDouble(), p[3].toDouble(), p[4].toFloat(), p[5].toLong()) }.getOrNull()?.let { updatePeer(peer.copy(location = it, sharing = true, lastSeen = System.currentTimeMillis())) }
+            "LOC" -> if (p.size >= 6 && peer.verified) receiveLocation(peer, p, 2)
+            "LOCREQ" -> if (p.size >= 3 && peer.verified) sendCurrentLocation(peer, force = true, requestId = p[2])
+            "LOCRES" -> if (p.size >= 7 && peer.verified) receiveLocation(peer, p, 3)
             "RINGPERM" -> if (p.size >= 3 && peer.verified) updatePeer(peer.copy(remoteAllowsRing = p[2] == "1"))
-            "RING" -> if (peer.verified) handleRing(peer)
-            "HELP" -> if (peer.verified) handleHelp(peer)
+            "RING" -> if (peer.verified) { handleRing(peer, p.getOrNull(3)?.let { runCatching { ToxEngine.decode(it).take(140) }.getOrDefault("") }.orEmpty()); p.getOrNull(2)?.let { engine.send(peer.friendNumber, "STL1|RINGACK|$it|${System.currentTimeMillis()}") } }
+            "RINGACK" -> if (p.size >= 4 && peer.verified && peer.ringRequestedAt?.toString() == p[2]) updatePeer(peer.copy(ringAcknowledgedAt = p[3].toLongOrNull() ?: System.currentTimeMillis()))
         }
     }
 
     private fun sendHello(peer: Peer) { if (peer.localNonce.isNotEmpty()) engine.send(peer.friendNumber, "STL1|HELLO|${peer.localNonce}|${ToxEngine.encode(_state.value.displayName)}") }
     private fun sendSharingState(peer: Peer) = engine.send(peer.friendNumber, "STL1|SHARE|${if (isActivelySharing()) 1 else 0}")
-    private fun sendCurrentLocation(peer: Peer) {
+    private fun sendCurrentLocation(peer: Peer, force: Boolean = true, requestId: String? = null) {
         if (!isActivelySharing()) return
-        _state.value.ownLocation?.let { point -> engine.send(peer.friendNumber, "STL1|LOC|${point.latitude}|${point.longitude}|${point.accuracy}|${point.timestamp}") }
+        _state.value.ownLocation?.let { point ->
+            if (force || shouldSendLocation(peer.id, point)) sendLocation(peer, point, requestId)
+        }
     }
     private fun sendRingPermission(peer: Peer) {
         val allowed = _state.value.settings.allowRing && peer.allowRing && (isActivelySharing() || _state.value.settings.allowRingWithoutLocation)
         engine.send(peer.friendNumber, "STL1|RINGPERM|${if (allowed) 1 else 0}")
     }
     private fun broadcastRingPermissions() = _state.value.peers.filter { it.verified && it.online }.forEach(::sendRingPermission)
-    private fun handleRing(peer: Peer) {
+    private fun handleRing(peer: Peer, message: String) {
         val current = _state.value
         if ((!current.sharing && !current.settings.allowRingWithoutLocation) || !current.settings.allowRing || !peer.allowRing) return
         val now = SystemClock.elapsedRealtime()
@@ -261,41 +290,61 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
         val showNotification = behavior != RingBehavior.SOUND_ONLY
         val playSound = behavior != RingBehavior.NOTIFICATION_ONLY && dndOff &&
             context.getSystemService(AudioManager::class.java).ringerMode == AudioManager.RINGER_MODE_NORMAL
-        if (showNotification) showRingNotification(peer, playSound)
+        if (showNotification) showRingNotification(peer, playSound, message)
         else if (playSound) RingtoneManager.getRingtone(context, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))?.play()
     }
-    private fun handleHelp(peer: Peer) {
-        val now = SystemClock.elapsedRealtime()
-        synchronized(lastRingAt) { val previous = lastRingAt["help:${peer.id}"]; if (previous != null && now - previous < 60_000L) return; lastRingAt["help:${peer.id}"] = now }
-        val manager = context.getSystemService(NotificationManager::class.java)
-        val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-        val attributes = android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_ALARM).setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
-        val channel = NotificationChannel("help_to_alert", "Avisos HelpTo", NotificationManager.IMPORTANCE_HIGH).apply {
-            description = "Avisos HelpTo de contactos verificados"
-            setSound(alarmUri, attributes)
-            enableVibration(true)
-            if (manager.isNotificationPolicyAccessGranted) setBypassDnd(true)
-        }
-        manager.createNotificationChannel(channel)
-        val open = PendingIntent.getActivity(context, 91, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notification = NotificationCompat.Builder(context, "help_to_alert").setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle("HelpTo de ${peer.displayName}").setContentText("Tu contacto ha pulsado su botón HelpTo").setPriority(NotificationCompat.PRIORITY_MAX).setCategory(NotificationCompat.CATEGORY_ALARM).setAutoCancel(true).setContentIntent(open).build()
-        if (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) NotificationManagerCompat.from(context).notify((peer.id.hashCode() and 0x7fffffff) + 1, notification)
-    }
-    private fun showRingNotification(peer: Peer, withSound: Boolean) {
+    private fun showRingNotification(peer: Peer, withSound: Boolean, message: String) {
         val channelId = if (withSound) "friend_ring_sound" else "friend_ring_silent"
         val manager = context.getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(channelId, if (withSound) "Hacer sonar" else "Avisos de contactos", if (withSound) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_DEFAULT)
         if (!withSound) channel.setSound(null, null)
         manager.createNotificationChannel(channel)
         val open = PendingIntent.getActivity(context, 90, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notification = NotificationCompat.Builder(context, channelId)
+        val builder = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle("${peer.displayName} te ha dado un toque")
-            .setContentText("Ha usado Hacer sonar en ShareToLocate")
-            .setAutoCancel(true).setContentIntent(open).setPriority(NotificationCompat.PRIORITY_HIGH).build()
+            .setContentText(message.ifBlank { "Ha usado Hacer sonar en ShareToLocate" })
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message.ifBlank { "Ha usado Hacer sonar en ShareToLocate" }))
+            .setAutoCancel(true).setContentIntent(open).setPriority(NotificationCompat.PRIORITY_HIGH)
+        peer.linkedContactPhone?.let { phone ->
+            val call = PendingIntent.getActivity(context, peer.id.hashCode(), Intent(Intent.ACTION_DIAL, android.net.Uri.parse("tel:${android.net.Uri.encode(phone)}")), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            builder.addAction(android.R.drawable.ic_menu_call, "Llamar", call)
+        }
+        val notification = builder.build()
         if (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
             NotificationManagerCompat.from(context).notify((peer.id.hashCode() and 0x7fffffff), notification)
         }
+    }
+    private fun sendLocation(peer: Peer, point: GeoPoint, requestId: String? = null): Boolean {
+        val type = if (requestId == null) "LOC" else "LOCRES|$requestId"
+        val sent = engine.send(peer.friendNumber, "STL1|$type|${point.latitude}|${point.longitude}|${point.accuracy}|${point.timestamp}")
+        if (sent) {
+            lastSentLocations[peer.id] = point
+            updateStats { it.copy(locationsSent = it.locationsSent + 1, lastSentAt = System.currentTimeMillis()) }
+        }
+        return sent
+    }
+    private fun shouldSendLocation(peerId: String, point: GeoPoint): Boolean {
+        val previous = lastSentLocations[peerId] ?: return true
+        val distance = FloatArray(1).also { Location.distanceBetween(previous.latitude, previous.longitude, point.latitude, point.longitude, it) }[0]
+        val interval = _state.value.settings.locationIntervalMinutes * 60_000L
+        val accuracyImproved = previous.accuracy <= 0f || (point.accuracy > 0f && point.accuracy <= previous.accuracy * 0.7f)
+        val meaningfulDistance = distance >= maxOf(5f, point.accuracy.coerceAtLeast(1f) * 0.6f)
+        return meaningfulDistance || accuracyImproved || point.timestamp - previous.timestamp >= interval
+    }
+    private fun receiveLocation(peer: Peer, parts: List<String>, offset: Int) {
+        val point = runCatching { GeoPoint(parts[offset].toDouble(), parts[offset + 1].toDouble(), parts[offset + 2].toFloat(), parts[offset + 3].toLong()) }.getOrNull() ?: return
+        if (!isValidLocation(point) || (peer.location?.timestamp ?: Long.MIN_VALUE) > point.timestamp) return
+        updatePeer(peer.copy(location = point, sharing = true, lastSeen = System.currentTimeMillis()))
+        updateStats { it.copy(locationsReceived = it.locationsReceived + 1, lastReceivedAt = System.currentTimeMillis()) }
+    }
+    private fun isValidLocation(point: GeoPoint) = point.latitude.isFinite() && point.longitude.isFinite() &&
+        point.latitude in -90.0..90.0 && point.longitude in -180.0..180.0 && point.accuracy.isFinite() && point.accuracy >= 0f
+    private fun GeoPoint.toJson() = JSONObject().put("latitude", latitude).put("longitude", longitude).put("accuracy", accuracy.toDouble()).put("timestamp", timestamp)
+    private fun updateStats(transform: (DeliveryStats) -> DeliveryStats) {
+        val stats = transform(_state.value.deliveryStats)
+        _state.value = _state.value.copy(deliveryStats = stats)
+        prefs.edit().putString("delivery_stats", JSONObject().put("captured",stats.locationsCaptured).put("sent",stats.locationsSent).put("suppressed",stats.locationsSuppressed).put("received",stats.locationsReceived).put("requests",stats.refreshRequestsSent).put("lastSent",stats.lastSentAt ?: 0).put("lastReceived",stats.lastReceivedAt ?: 0).toString()).apply()
     }
     private fun verificationCode(peer: Peer): String? {
         if (peer.localNonce.isEmpty() || peer.remoteNonce.isEmpty() || !_state.value.identityReady) return null
@@ -307,18 +356,27 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
     }
     private fun savePeers() {
         val arr = JSONArray(); _state.value.peers.forEach { peer ->
-            val item = JSONObject().put("id",peer.id).put("name",peer.name).put("nickname",peer.nickname).put("number",peer.friendNumber).put("verified",peer.verified).put("localNonce",peer.localNonce).put("remoteNonce",peer.remoteNonce).put("allowRing",peer.allowRing).put("sharing",peer.sharing).put("lastSeen",peer.lastSeen)
+            val item = JSONObject().put("id",peer.id).put("name",peer.name).put("nickname",peer.nickname).put("number",peer.friendNumber).put("verified",peer.verified).put("localNonce",peer.localNonce).put("remoteNonce",peer.remoteNonce).put("allowRing",peer.allowRing).put("showInFollowMenu",peer.showInFollowMenu).put("linkedContactName",peer.linkedContactName).put("linkedContactPhone",peer.linkedContactPhone).put("sharing",peer.sharing).put("lastSeen",peer.lastSeen)
             peer.location?.let { item.put("latitude",it.latitude).put("longitude",it.longitude).put("accuracy",it.accuracy.toDouble()).put("locationTime",it.timestamp) }
             arr.put(item)
         }
         prefs.edit().putString("peers", arr.toString()).apply()
     }
-    private fun saveSettings() { _state.value.settings.let { prefs.edit().putBoolean("smooth_mine",it.smoothMine).putBoolean("smooth_friends",it.smoothFriends).putBoolean("secure",it.preventScreenshots).putBoolean("screen_on",it.keepScreenOn).putString("theme",it.themeMode.name).putString("map_style",it.mapStyle.name).putString("accent",it.accentColor.name).putBoolean("allow_ring",it.allowRing).putBoolean("allow_ring_without_location",it.allowRingWithoutLocation).putString("ring_behavior",it.ringBehavior.name).putInt("location_interval",it.locationIntervalMinutes).putBoolean("start_locate_on_boot",it.startLocateOnBoot).putBoolean("help_to_enabled",it.helpToEnabled).putString("help_to_peer",it.helpToPeerId).apply() } }
-    private fun loadSettings() = AppSettings(smoothMine=prefs.getBoolean("smooth_mine",true), smoothFriends=prefs.getBoolean("smooth_friends",true), preventScreenshots=prefs.getBoolean("secure",true), keepScreenOn=prefs.getBoolean("screen_on",false), themeMode=runCatching { ThemeMode.valueOf(prefs.getString("theme","DARK")!!) }.getOrDefault(ThemeMode.DARK), mapStyle=runCatching { MapStyle.valueOf(prefs.getString("map_style","STREETS")!!) }.getOrDefault(MapStyle.STREETS), accentColor=runCatching { AccentColor.valueOf(prefs.getString("accent","MINT")!!) }.getOrDefault(AccentColor.MINT), allowRing=prefs.getBoolean("allow_ring",false), allowRingWithoutLocation=prefs.getBoolean("allow_ring_without_location",false), ringBehavior=runCatching { RingBehavior.valueOf(prefs.getString("ring_behavior","NOTIFICATION_ONLY")!!) }.getOrDefault(RingBehavior.NOTIFICATION_ONLY), locationIntervalMinutes=prefs.getInt("location_interval",15), startLocateOnBoot=prefs.getBoolean("start_locate_on_boot",true), helpToEnabled=prefs.getBoolean("help_to_enabled",false), helpToPeerId=prefs.getString("help_to_peer",null))
+    private fun saveSettings() { _state.value.settings.let { settings -> prefs.edit().putBoolean("smooth_mine",settings.smoothMine).putBoolean("smooth_friends",settings.smoothFriends).putBoolean("secure",settings.preventScreenshots).putBoolean("screen_on",settings.keepScreenOn).putString("theme",settings.themeMode.name).putString("map_style",settings.mapStyle.name).putString("accent",settings.accentColor.name).putBoolean("allow_ring",settings.allowRing).putBoolean("allow_ring_without_location",settings.allowRingWithoutLocation).putString("ring_behavior",settings.ringBehavior.name).putInt("location_interval",settings.locationIntervalMinutes).putBoolean("start_locate_on_boot",settings.startLocateOnBoot).apply { settings.defaultMapCenter?.let { point -> putString("default_map_center", point.toJson().toString()) } ?: remove("default_map_center") }.apply() } }
+    private fun loadSettings(): AppSettings {
+        val center = runCatching { JSONObject(prefs.getString("default_map_center", null)!!).let { GeoPoint(it.getDouble("latitude"), it.getDouble("longitude"), it.optDouble("accuracy").toFloat(), it.optLong("timestamp", 0L)) } }.getOrNull()?.takeIf(::isValidLocation)
+        return AppSettings(smoothMine=prefs.getBoolean("smooth_mine",true), smoothFriends=prefs.getBoolean("smooth_friends",true), preventScreenshots=prefs.getBoolean("secure",true), keepScreenOn=prefs.getBoolean("screen_on",false), themeMode=runCatching { ThemeMode.valueOf(prefs.getString("theme","LIGHT")!!) }.getOrDefault(ThemeMode.LIGHT), mapStyle=runCatching { MapStyle.valueOf(prefs.getString("map_style","STREETS")!!) }.getOrDefault(MapStyle.STREETS), accentColor=runCatching { AccentColor.valueOf(prefs.getString("accent","MINT")!!) }.getOrDefault(AccentColor.MINT), allowRing=prefs.getBoolean("allow_ring",false), allowRingWithoutLocation=prefs.getBoolean("allow_ring_without_location",false), ringBehavior=runCatching { RingBehavior.valueOf(prefs.getString("ring_behavior","NOTIFICATION_WITH_SOUND")!!) }.getOrDefault(RingBehavior.NOTIFICATION_WITH_SOUND), locationIntervalMinutes=prefs.getInt("location_interval",15), startLocateOnBoot=prefs.getBoolean("start_locate_on_boot",true), defaultMapCenter=center)
+    }
+    private fun loadOwnLocation(): GeoPoint? = runCatching {
+        JSONObject(prefs.getString("own_location", null)!!).let { GeoPoint(it.getDouble("latitude"), it.getDouble("longitude"), it.optDouble("accuracy").toFloat(), it.getLong("timestamp")) }
+    }.getOrNull()?.takeIf(::isValidLocation)
+    private fun loadDeliveryStats(): DeliveryStats = runCatching {
+        JSONObject(prefs.getString("delivery_stats", null)!!).let { DeliveryStats(it.optLong("captured"), it.optLong("sent"), it.optLong("suppressed"), it.optLong("received"), it.optLong("requests"), it.optLong("lastSent").takeIf { value -> value > 0 }, it.optLong("lastReceived").takeIf { value -> value > 0 }) }
+    }.getOrDefault(DeliveryStats())
     private fun loadPeers(): List<Peer> = runCatching {
         val arr = JSONArray(prefs.getString("peers", "[]")); (0 until arr.length()).map { i -> arr.getJSONObject(i).let { item ->
             val location = if (item.has("latitude") && item.has("longitude")) GeoPoint(item.getDouble("latitude"), item.getDouble("longitude"), item.optDouble("accuracy",0.0).toFloat(), item.optLong("locationTime",System.currentTimeMillis())) else null
-            Peer(id=item.getString("id"), name=item.getString("name"), nickname=item.optString("nickname").takeIf { it.isNotBlank() && it != "null" }, friendNumber=item.optLong("number",-1), sharing=item.optBoolean("sharing"), location=location, lastSeen=item.optLong("lastSeen").takeIf { value -> value > 0 }, verified=item.optBoolean("verified"), localNonce=item.optString("localNonce"), remoteNonce=item.optString("remoteNonce"), allowRing=item.optBoolean("allowRing"))
+            Peer(id=item.getString("id"), name=item.getString("name"), nickname=item.optString("nickname").takeIf { it.isNotBlank() && it != "null" }, friendNumber=item.optLong("number",-1), sharing=item.optBoolean("sharing"), location=location, lastSeen=item.optLong("lastSeen").takeIf { value -> value > 0 }, verified=item.optBoolean("verified"), localNonce=item.optString("localNonce"), remoteNonce=item.optString("remoteNonce"), allowRing=item.optBoolean("allowRing"), showInFollowMenu=item.optBoolean("showInFollowMenu", true), linkedContactName=item.optString("linkedContactName").takeIf { it.isNotBlank() && it != "null" }, linkedContactPhone=item.optString("linkedContactPhone").takeIf { it.isNotBlank() && it != "null" })
         } }
     }.getOrDefault(emptyList())
 

@@ -19,8 +19,23 @@ data class Peer(
     val localNonce: String = "",
     val remoteNonce: String = "",
     val allowRing: Boolean = false,
-    val remoteAllowsRing: Boolean = false
+    val remoteAllowsRing: Boolean = false,
+    val showInFollowMenu: Boolean = true,
+    val linkedContactName: String? = null,
+    val linkedContactPhone: String? = null,
+    val ringRequestedAt: Long? = null,
+    val ringAcknowledgedAt: Long? = null
 ) { val displayName: String get() = nickname?.trim()?.takeIf { it.isNotEmpty() } ?: name }
+
+data class DeliveryStats(
+    val locationsCaptured: Long = 0,
+    val locationsSent: Long = 0,
+    val locationsSuppressed: Long = 0,
+    val locationsReceived: Long = 0,
+    val refreshRequestsSent: Long = 0,
+    val lastSentAt: Long? = null,
+    val lastReceivedAt: Long? = null
+)
 
 data class ContactRequest(val publicKey: String, val name: String, val nonce: String, val receivedAt: Long = System.currentTimeMillis())
 
@@ -36,16 +51,15 @@ data class AppSettings(
     val preventScreenshots: Boolean = true,
     val keepScreenOn: Boolean = false,
     val preciseMode: Boolean = true,
-    val themeMode: ThemeMode = ThemeMode.DARK,
+    val themeMode: ThemeMode = ThemeMode.LIGHT,
     val mapStyle: MapStyle = MapStyle.STREETS,
     val accentColor: AccentColor = AccentColor.MINT,
     val allowRing: Boolean = false,
     val allowRingWithoutLocation: Boolean = false,
-    val ringBehavior: RingBehavior = RingBehavior.NOTIFICATION_ONLY,
+    val ringBehavior: RingBehavior = RingBehavior.NOTIFICATION_WITH_SOUND,
     val locationIntervalMinutes: Int = 15,
     val startLocateOnBoot: Boolean = true,
-    val helpToEnabled: Boolean = false,
-    val helpToPeerId: String? = null
+    val defaultMapCenter: GeoPoint? = null
 )
 
 data class AppState(
@@ -62,5 +76,6 @@ data class AppState(
     val pendingRequests: List<ContactRequest> = emptyList(),
     val onboardingComplete: Boolean = false,
     val identityReady: Boolean = false,
-    val networkConnected: Boolean = false
+    val networkConnected: Boolean = false,
+    val deliveryStats: DeliveryStats = DeliveryStats()
 )

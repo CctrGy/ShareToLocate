@@ -16,7 +16,9 @@ class LocationSharingService : Service() {
     private lateinit var fused: FusedLocationProviderClient
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            result.lastLocation?.let { ShareRepository.get(this@LocationSharingService).setOwnLocation(GeoPoint(it.latitude, it.longitude, it.accuracy, it.time)) }
+            result.locations.filter { it.hasAccuracy() && it.accuracy <= 100f }
+                .minWithOrNull(compareBy<android.location.Location> { it.accuracy }.thenByDescending { it.time })
+                ?.let { ShareRepository.get(this@LocationSharingService).setOwnLocation(GeoPoint(it.latitude, it.longitude, it.accuracy, it.time)) }
         }
     }
 
@@ -28,12 +30,21 @@ class LocationSharingService : Service() {
         startForeground(NOTIFICATION_ID, notification())
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
             fused.removeLocationUpdates(callback)
-            val interval = ShareRepository.get(this).state.value.settings.locationIntervalMinutes * 60_000L
-            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, interval).setMinUpdateIntervalMillis(interval / 2).setMinUpdateDistanceMeters(3f).build()
-            fused.requestLocationUpdates(request, callback, mainLooper)
             val repository = ShareRepository.get(this)
+            val settings = repository.state.value.settings
+            val interval = settings.locationIntervalMinutes * 60_000L
+            val priority = if (settings.preciseMode) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            val request = LocationRequest.Builder(priority, interval)
+                .setMinUpdateIntervalMillis((interval / 3).coerceAtLeast(15_000L))
+                .setMaxUpdateDelayMillis(interval)
+                .setMinUpdateDistanceMeters(if (settings.preciseMode) 2f else 10f)
+                .setWaitForAccurateLocation(settings.preciseMode)
+                .setGranularity(Granularity.GRANULARITY_FINE)
+                .build()
+            fused.requestLocationUpdates(request, callback, mainLooper)
             if (intent?.action != ACTION_REFRESH_INTERVAL) repository.setSharing(true)
-            fused.lastLocation.addOnSuccessListener { location -> location?.let { repository.setOwnLocation(GeoPoint(it.latitude, it.longitude, it.accuracy, it.time)) } }
+            fused.getCurrentLocation(CurrentLocationRequest.Builder().setPriority(priority).setMaxUpdateAgeMillis(30_000L).setGranularity(Granularity.GRANULARITY_FINE).build(), null)
+                .addOnSuccessListener { location -> location?.let { repository.setOwnLocation(GeoPoint(it.latitude, it.longitude, it.accuracy, it.time)) } }
         }
         return START_STICKY
     }
