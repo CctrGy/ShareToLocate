@@ -1,7 +1,7 @@
 {
   "packageName": "com.sharetolocate.app",
-  "versionName": "1.3.7",
-  "versionCode": 14,
-  "sha256": "0167ecc23e980461baa7b9d30d11904b19c0301763a47baec477420e72e261a3",
+  "versionName": "1.3.9",
+  "versionCode": 16,
+  "sha256": "31ee8efecf54608d01489bcf20dbe95635e5c94000a222f240688f0ecaef14fa",
   "certificateSha256": "3674ffdb09b47d4aecd78d9765d6e5aca842fdde367f0b09e156794e4bc61680"
 }
