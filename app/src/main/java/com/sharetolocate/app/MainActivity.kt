@@ -352,7 +352,7 @@ private data class ValidatedMapLocations(val own: GeoPoint?, val peers: Map<Stri
                 locations.own?.let { marker(map, it, "Tu ubicacion", android.R.drawable.ic_menu_mylocation) }
                 val activePeers = state.peers.filter { it.online && it.sharing }.mapNotNull { peer -> locations.peers[peer.id]?.let { peer to it } }
                 activePeers.forEach { (peer, point) ->
-                    marker(map, point, peer.displayName, android.R.drawable.ic_menu_mylocation)
+                    marker(map, point, peer.displayName, android.R.drawable.ic_menu_mylocation, peer.accent)
                 }
                 val focus = when (state.followTarget) {
                     FollowTarget.ME -> locations.own
@@ -467,7 +467,7 @@ private fun fitMapToPointsSafely(map: MapView, points: List<OsmPoint>, paddingPx
     })
 }
 
-private fun marker(map: MapView, point: GeoPoint, title: String, icon: Int) { map.overlays.add(Marker(map).apply { position = OsmPoint(point.latitude, point.longitude); this.title = title; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM); this.icon = ContextCompat.getDrawable(map.context, icon) }) }
+private fun marker(map: MapView, point: GeoPoint, title: String, icon: Int, tint: Long? = null) { map.overlays.add(Marker(map).apply { position = OsmPoint(point.latitude, point.longitude); this.title = title; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM); this.icon = ContextCompat.getDrawable(map.context, icon)?.mutate()?.also { drawable -> tint?.let { drawable.setTint(it.toInt()) } } }) }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun FollowSelector(state: AppState, repository: ShareRepository) {
@@ -541,6 +541,7 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
     val context = LocalContext.current
     var editNickname by remember { mutableStateOf(false) }
     var showRingDialog by remember { mutableStateOf(false) }
+    var showColorDialog by remember { mutableStateOf(false) }
     var expanded by rememberSaveable(peer.id) { mutableStateOf(false) }
     val contactPicker = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val uri = result.data?.data ?: return@rememberLauncherForActivityResult
@@ -559,27 +560,31 @@ private fun qrBitmap(content: String, size: Int): Bitmap { val matrix = QRCodeWr
         }
     }
     val canRing = peer.verified && peer.online && peer.remoteAllowsRing
-    val ringLabel = when {
-        peer.ringRequestedAt == null -> "Hacer sonar"
-        peer.ringAcknowledgedAt != null -> "Respondido en ${((peer.ringAcknowledgedAt - peer.ringRequestedAt).coerceAtLeast(0) / 1000.0)} s"
-        clock - peer.ringRequestedAt < 60_000L -> "Esperando respuesta... ${(clock - peer.ringRequestedAt) / 1000} s"
-        else -> "Sin respuesta · Reintentar"
-    }
+    val cooldownSeconds = peer.ringRequestedAt?.let { requestedAt -> ((60_000L - (clock - requestedAt)).coerceAtLeast(0L) + 999L) / 1_000L } ?: 0L
+    val cooldownActive = cooldownSeconds > 0L && peer.ringAcknowledgedAt == null
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) { Column(Modifier.padding(16.dp)) {
         Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }, verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(50.dp).background(MaterialTheme.colorScheme.primary.copy(.18f), CircleShape), contentAlignment = Alignment.Center) { Text(peer.displayName.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 20.sp) }; Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Row(verticalAlignment = Alignment.CenterVertically) { Text(peer.displayName, fontWeight = FontWeight.SemiBold, fontSize = 17.sp); Spacer(Modifier.width(8.dp)); Box(Modifier.size(7.dp).background(if (peer.online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, CircleShape)) }; if (peer.nickname != null) Text("Nombre original: ${peer.name}", color = Muted, fontSize = 11.sp); Text(if (peer.sharing) "Compartiendo ahora" else if (peer.location != null) "Última ubicación guardada" else if (peer.online) "En línea" else "Sin conexión", color = if (peer.sharing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp); Text(peer.id, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(.65f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }; IconButton({ editNickname = true }) { Icon(Icons.Default.Edit, "Editar alias") }; IconButton(onClick = remove) { Icon(Icons.Default.DeleteOutline, "Eliminar", tint = MaterialTheme.colorScheme.onSurfaceVariant) }; Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, if (expanded) "Ocultar opciones" else "Mostrar opciones") }
-        Spacer(Modifier.height(8.dp)); OutlinedButton(onClick = { showRingDialog = true }, enabled = canRing && (peer.ringRequestedAt == null || peer.ringAcknowledgedAt != null || clock - peer.ringRequestedAt >= 60_000L), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(7.dp)); Text(ringLabel) }
+        Spacer(Modifier.height(8.dp)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) { OutlinedButton(onClick = { if (repository.ringPeer(peer.id)) Toast.makeText(context, "Toque enviado", Toast.LENGTH_SHORT).show() }, enabled = canRing && !cooldownActive, modifier = Modifier.weight(1f)) { Icon(Icons.Default.NotificationsActive, null); Spacer(Modifier.width(7.dp)); Text("Hacer sonar") }; OutlinedIconButton(onClick = { showRingDialog = true }, enabled = canRing && !cooldownActive) { Icon(Icons.Default.MoreHoriz, "Mensaje personalizado") } }
+        if (cooldownActive) Text("Podrás enviar otro toque en ${cooldownSeconds} s", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+        else if (peer.ringRequestedAt != null && peer.ringAcknowledgedAt != null) Text("Respondido en ${((peer.ringAcknowledgedAt - peer.ringRequestedAt).coerceAtLeast(0) / 1000.0)} s", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
         AnimatedVisibility(expanded) { Column {
         Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Notifications, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Permitir hacer sonar", Modifier.weight(1f), fontSize = 13.sp); Switch(peer.allowRing, { repository.setPeerRingAllowed(peer.id, it) }, enabled = peer.verified) }
         Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Visibility, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Mostrar en el menu Seguir a", Modifier.weight(1f), fontSize = 13.sp); Switch(peer.showInFollowMenu, { repository.setPeerFollowMenuVisible(peer.id, it) }, enabled = peer.location != null) }
         TextButton(onClick = viewOnMap, enabled = peer.location != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PersonPinCircle, null); Spacer(Modifier.width(7.dp)); Text(if (peer.sharing) "Ver en el mapa" else "Ver última ubicación") }
         TextButton(onClick = { peer.location?.let { openInGoogleMaps(context, it, peer.displayName) } }, enabled = peer.location != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Map, null); Spacer(Modifier.width(7.dp)); Text("Abrir coordenadas en Google Maps") }
-        TextButton(onClick = { contactPicker.launch(Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PersonAdd, null); Spacer(Modifier.width(7.dp)); Text(peer.linkedContactName?.let { "Contacto vinculado: $it" } ?: "Vincular contacto para llamar") }
+        TextButton(onClick = { contactPicker.launch(Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PersonAdd, null); Spacer(Modifier.width(7.dp)); Text(peer.linkedContactName?.let { "Contacto vinculado: $it" } ?: "Vincular contacto para llamar o WhatsApp") }
+        TextButton(onClick = { showColorDialog = true }, modifier = Modifier.fillMaxWidth()) { Box(Modifier.size(18.dp).background(Color(peer.accent), CircleShape)); Spacer(Modifier.width(9.dp)); Text("Color del cursor") }
         if (peer.linkedContactPhone != null) TextButton(onClick = { repository.setPeerLinkedContact(peer.id, null, null) }, modifier = Modifier.align(Alignment.End)) { Text("Quitar contacto vinculado") }
         if (!canRing) Text(when { !peer.online -> "Disponible cuando esté en línea"; !peer.remoteAllowsRing -> "${peer.displayName} no te ha dado permiso"; else -> "Contacto pendiente de verificación" }, color = Muted, fontSize = 11.sp)
         } }
     } }
     if (editNickname) NicknameDialog(peer, repository) { editNickname = false }
     if (showRingDialog) RingMessageDialog(peer, repository) { showRingDialog = false }
+    if (showColorDialog) PeerColorDialog(peer, repository) { showColorDialog = false }
+}
+
+@Composable private fun PeerColorDialog(peer: Peer, repository: ShareRepository, close: () -> Unit) {
+    AlertDialog(onDismissRequest = close, title = { Text("Color de ${peer.displayName}") }, text = { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { AccentColor.entries.forEach { option -> val selected = peer.accent == option.argb; Surface(onClick = { repository.setPeerAccent(peer.id, option.argb); close() }, modifier = Modifier.size(40.dp), shape = CircleShape, color = Color(option.argb), border = if (selected) BorderStroke(3.dp, MaterialTheme.colorScheme.onSurface) else null) { if (selected) Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.Check, null, tint = Ink) } } } } }, confirmButton = { TextButton(close) { Text("Cerrar") } })
 }
 
 @Composable private fun RingMessageDialog(peer: Peer, repository: ShareRepository, close: () -> Unit) {

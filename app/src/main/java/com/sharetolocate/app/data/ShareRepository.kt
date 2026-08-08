@@ -125,6 +125,9 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
             updatePeer(it.copy(linkedContactName = name?.trim()?.ifBlank { null }, linkedContactPhone = phone?.trim()?.ifBlank { null }))
         }
     }
+    fun setPeerAccent(id: String, color: Long) {
+        _state.value.peers.firstOrNull { it.id == id }?.let { updatePeer(it.copy(accent = color)) }
+    }
     fun setLocationInterval(minutes: Int) {
         val value = minutes.takeIf { it in listOf(3,6,12,15,20,30,60) } ?: 15
         updateSettings { it.copy(locationIntervalMinutes = value) }
@@ -309,6 +312,8 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
         peer.linkedContactPhone?.let { phone ->
             val call = PendingIntent.getActivity(context, peer.id.hashCode(), Intent(Intent.ACTION_DIAL, android.net.Uri.parse("tel:${android.net.Uri.encode(phone)}")), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             builder.addAction(android.R.drawable.ic_menu_call, "Llamar", call)
+            val whatsapp = PendingIntent.getActivity(context, peer.id.hashCode() xor 0x51A7, Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://wa.me/${phone.filter(Char::isDigit)}")).setPackage("com.whatsapp"), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            builder.addAction(android.R.drawable.sym_action_chat, "WhatsApp", whatsapp)
         }
         val notification = builder.build()
         if (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
@@ -356,7 +361,7 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
     }
     private fun savePeers() {
         val arr = JSONArray(); _state.value.peers.forEach { peer ->
-            val item = JSONObject().put("id",peer.id).put("name",peer.name).put("nickname",peer.nickname).put("number",peer.friendNumber).put("verified",peer.verified).put("localNonce",peer.localNonce).put("remoteNonce",peer.remoteNonce).put("allowRing",peer.allowRing).put("showInFollowMenu",peer.showInFollowMenu).put("linkedContactName",peer.linkedContactName).put("linkedContactPhone",peer.linkedContactPhone).put("sharing",peer.sharing).put("lastSeen",peer.lastSeen)
+            val item = JSONObject().put("id",peer.id).put("name",peer.name).put("nickname",peer.nickname).put("number",peer.friendNumber).put("verified",peer.verified).put("localNonce",peer.localNonce).put("remoteNonce",peer.remoteNonce).put("allowRing",peer.allowRing).put("showInFollowMenu",peer.showInFollowMenu).put("accent",peer.accent).put("linkedContactName",peer.linkedContactName).put("linkedContactPhone",peer.linkedContactPhone).put("sharing",peer.sharing).put("lastSeen",peer.lastSeen)
             peer.location?.let { item.put("latitude",it.latitude).put("longitude",it.longitude).put("accuracy",it.accuracy.toDouble()).put("locationTime",it.timestamp) }
             arr.put(item)
         }
@@ -376,7 +381,7 @@ class ShareRepository private constructor(private val context: Context) : ToxEng
     private fun loadPeers(): List<Peer> = runCatching {
         val arr = JSONArray(prefs.getString("peers", "[]")); (0 until arr.length()).map { i -> arr.getJSONObject(i).let { item ->
             val location = if (item.has("latitude") && item.has("longitude")) GeoPoint(item.getDouble("latitude"), item.getDouble("longitude"), item.optDouble("accuracy",0.0).toFloat(), item.optLong("locationTime",System.currentTimeMillis())) else null
-            Peer(id=item.getString("id"), name=item.getString("name"), nickname=item.optString("nickname").takeIf { it.isNotBlank() && it != "null" }, friendNumber=item.optLong("number",-1), sharing=item.optBoolean("sharing"), location=location, lastSeen=item.optLong("lastSeen").takeIf { value -> value > 0 }, verified=item.optBoolean("verified"), localNonce=item.optString("localNonce"), remoteNonce=item.optString("remoteNonce"), allowRing=item.optBoolean("allowRing"), showInFollowMenu=item.optBoolean("showInFollowMenu", true), linkedContactName=item.optString("linkedContactName").takeIf { it.isNotBlank() && it != "null" }, linkedContactPhone=item.optString("linkedContactPhone").takeIf { it.isNotBlank() && it != "null" })
+            Peer(id=item.getString("id"), name=item.getString("name"), nickname=item.optString("nickname").takeIf { it.isNotBlank() && it != "null" }, friendNumber=item.optLong("number",-1), sharing=item.optBoolean("sharing"), location=location, lastSeen=item.optLong("lastSeen").takeIf { value -> value > 0 }, accent=item.optLong("accent", 0xFF67E8B6), verified=item.optBoolean("verified"), localNonce=item.optString("localNonce"), remoteNonce=item.optString("remoteNonce"), allowRing=item.optBoolean("allowRing"), showInFollowMenu=item.optBoolean("showInFollowMenu", true), linkedContactName=item.optString("linkedContactName").takeIf { it.isNotBlank() && it != "null" }, linkedContactPhone=item.optString("linkedContactPhone").takeIf { it.isNotBlank() && it != "null" })
         } }
     }.getOrDefault(emptyList())
 

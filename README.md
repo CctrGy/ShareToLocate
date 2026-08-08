@@ -22,6 +22,10 @@ The project is based on the concept and core workflow of zoff99's ToLoShare. Sha
 - Configurable ring behavior: silent notification, notification with sound, or sound only.
 - Automatic respect for Android Do Not Disturb and silent modes.
 - Changeable application lock PIN.
+- One-tap standard attention requests, with an optional custom-message menu and visible resend countdown.
+- Per-contact marker colors, saved locally and rendered on the map.
+- Optional phone contact links with quick Call and WhatsApp actions in attention notifications.
+- Collapsible contact cards and settings categories to keep the interface focused.
 
 ## Changes and Improvements over ToLoShare
 
