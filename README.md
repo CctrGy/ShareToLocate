@@ -133,3 +133,8 @@ ToLoShare and ToxAndroidRefImpl are also distributed under GPL-3.0-only. Their r
 ## Disclaimer
 
 Location-sharing software handles sensitive personal data. Review the source, permissions, privacy policy, and release configuration before distributing or relying on the application.
+
+## Support the project
+
+If ShareToLocate is useful to you, you can follow and support its development at
+[CctrGy Donations](https://cctrgy.github.io/donations.html).
